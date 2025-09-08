@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import os
-from collections import deque
 from torch.distributions import Normal
 
 # TensorBoard 선택적 import
@@ -15,7 +14,6 @@ except ImportError:
     print("Warning: TensorBoard not available. Install with: pip install tensorboard")
     TENSORBOARD_AVAILABLE = False
     SummaryWriter = None
-
 
 class RunningMeanStd:
     """보상 정규화를 위한 실행 평균/표준편차 계산"""
@@ -44,11 +42,33 @@ class RunningMeanStd:
         self.var = new_var
         self.count = tot_count
 
+# =======================================================
+# Path 기반 Encoder (CSV horizon point 입력)
+# =======================================================
+class PathFeatureEncoder(nn.Module):
+    """
+    경로 horizon 점들과 차량 상태(위치, heading, velocity 등)를 받아
+    feature 벡터로 변환하는 인코더
+    """
+    def __init__(self, input_dim, output_dim=256):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, output_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.network(x)
 
 class PPOActor(nn.Module):
     """PPO Actor 네트워크"""
-    def __init__(self, feature_dim, action_dim, hidden_dim=256):
+    def __init__(self, feature_dim, action_dim, hidden_dim=512):
         super().__init__()
+        
         self.network = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(),
@@ -57,14 +77,16 @@ class PPOActor(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
+        
         self.mean_head = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
-
+        
         # 초기화
         for layer in self.network:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
                 nn.init.constant_(layer.bias, 0)
+        
         nn.init.orthogonal_(self.mean_head.weight, gain=0.01)
         nn.init.constant_(self.mean_head.bias, 0)
 
@@ -79,9 +101,10 @@ class PPOActor(nn.Module):
         dist = Normal(mean, std)
         raw_action = dist.rsample()
         action = torch.tanh(raw_action)
-
+        
         log_prob = dist.log_prob(raw_action).sum(dim=-1, keepdim=True)
         log_prob -= torch.log(1 - action.pow(2) + 1e-7).sum(dim=-1, keepdim=True)
+        
         return action, log_prob
 
     def get_log_prob(self, x, action):
@@ -92,11 +115,11 @@ class PPOActor(nn.Module):
         log_prob -= torch.log(1 - action.pow(2) + 1e-7).sum(dim=-1, keepdim=True)
         return log_prob
 
-
 class PPOCritic(nn.Module):
     """PPO Critic 네트워크"""
-    def __init__(self, feature_dim, hidden_dim=256):
+    def __init__(self, feature_dim, hidden_dim=512):
         super().__init__()
+        
         self.network = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(),
@@ -106,7 +129,8 @@ class PPOCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
-
+        
+        # 초기화
         for layer in self.network[:-1]:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
@@ -116,7 +140,6 @@ class PPOCritic(nn.Module):
 
     def forward(self, x):
         return self.network(x)
-
 
 class PPOBuffer:
     """PPO 경험 버퍼"""
@@ -140,7 +163,7 @@ class PPOBuffer:
         self.current_episode_length += 1
 
         if done and self.current_episode_length <= 3:
-            print(f"[BUFFER] 극단적으로 짧은 에피소드 ({self.current_episode_length}스텝) 제거")
+            print(f"[BUFFER] 극단적으로 짧은 에피소드 제거 ({self.current_episode_length} step)")
             self.remove_last_episode()
             return True
         return False
@@ -167,30 +190,35 @@ class PPOBuffer:
     def size(self):
         return len(self.states)
 
-
-class PPOAgentVector:
-    """CSV 기반 벡터 관측을 위한 PPO 에이전트"""
+class PPOAgent:
+    """경로 추종을 위한 PPO 에이전트"""
     def __init__(self, obs_dim, action_dim, action_bounds, log_dir=None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Device: {self.device}")
-
+        
+        # 하이퍼파라미터
         self.gamma, self.lam = 0.995, 0.95
         self.clip_epsilon, self.c1, self.c2 = 0.2, 0.5, 0.01
-        self.ppo_epochs, self.mini_batch_size = 10, 64
+        self.ppo_epochs, self.mini_batch_size = 10, 128
         self.max_grad_norm = 0.5
-
-        self.actor = PPOActor(obs_dim, action_dim).to(self.device)
-        self.critic = PPOCritic(obs_dim).to(self.device)
-
+        
+        # 네트워크
+        feature_dim = 256
+        self.encoder = PathFeatureEncoder(obs_dim, feature_dim).to(self.device)
+        self.actor = PPOActor(feature_dim, action_dim).to(self.device)
+        self.critic = PPOCritic(feature_dim).to(self.device)
+        
+        # Optimizer
+        self.encoder_opt = optim.Adam(self.encoder.parameters(), lr=1e-4)
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=1e-4)
-
+        
+        # Buffer
         self.buffer = PPOBuffer()
         self.action_bounds = action_bounds
-
         self.reward_rms = RunningMeanStd()
         self.normalize_rewards = True
-
+        
         if log_dir and TENSORBOARD_AVAILABLE:
             self.writer = SummaryWriter(log_dir=log_dir)
             self.log_enabled = True
@@ -204,7 +232,8 @@ class PPOAgentVector:
             return torch.FloatTensor(obs).unsqueeze(0).to(self.device)
 
     def get_action(self, obs, training=True):
-        feature = self.preprocess_obs(obs)
+        feature_in = self.preprocess_obs(obs)
+        feature = self.encoder(feature_in)
         with torch.no_grad():
             if training:
                 action, log_prob = self.actor.get_action_and_log_prob(feature)
@@ -223,8 +252,8 @@ class PPOAgentVector:
         scaled = []
         for i in range(len(action)):
             low, high = self.action_bounds[i]
-            scaled_val = (action[i] + 1) / 2 * (high - low) + low
-            scaled.append(np.clip(scaled_val, low, high))
+            val = (action[i] + 1) / 2 * (high - low) + low
+            scaled.append(np.clip(val, low, high))
         return np.array(scaled, dtype=np.float32)
 
     def _unscale_action(self, scaled_action):
@@ -246,7 +275,7 @@ class PPOAgentVector:
     def compute_gae(self, rewards, values, dones, next_values):
         advs, gae = [], 0
         for i in reversed(range(len(rewards))):
-            delta = rewards[i] + self.gamma * (next_values[i]) * (1 - dones[i]) - values[i]
+            delta = rewards[i] + self.gamma * next_values[i] * (1 - dones[i]) - values[i]
             gae = delta + self.gamma * self.lam * (1 - dones[i]) * gae
             advs.insert(0, gae)
         returns = [a + v for a, v in zip(advs, values)]
@@ -262,6 +291,7 @@ class PPOAgentVector:
         advantages = (np.array(advantages) - np.mean(advantages)) / (np.std(advantages) + 1e-8)
 
         states_tensor = self.preprocess_obs(states, is_batch=True)
+        states_tensor = self.encoder(states_tensor)
         actions_tensor = torch.FloatTensor(actions).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device).unsqueeze(1)
         advantages_tensor = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
@@ -272,7 +302,6 @@ class PPOAgentVector:
             for start in range(0, len(states), self.mini_batch_size):
                 end = min(start+self.mini_batch_size, len(states))
                 mb_idx = indices[start:end]
-
                 mb_states = states_tensor[mb_idx]
                 mb_actions = actions_tensor[mb_idx]
                 mb_old_log_probs = old_log_probs_tensor[mb_idx]
@@ -288,9 +317,12 @@ class PPOAgentVector:
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = F.mse_loss(new_values, mb_ret)
 
+                self.encoder_opt.zero_grad()
                 self.actor_opt.zero_grad()
-                actor_loss.backward()
+                actor_loss.backward(retain_graph=True)
+                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                self.encoder_opt.step()
                 self.actor_opt.step()
 
                 self.critic_opt.zero_grad()
@@ -301,23 +333,15 @@ class PPOAgentVector:
         self.buffer.clear()
         return {"actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
 
-    def log_episode_metrics(self, episode, reward, length, total_steps):
-        if self.log_enabled:
-            self.writer.add_scalar('Episode/Reward', reward, episode)
-            self.writer.add_scalar('Episode/Length', length, episode)
-            self.writer.add_scalar('Episode/Total_Steps', total_steps, episode)
-
     def save_model(self, save_path):
         os.makedirs(save_path, exist_ok=True)
-        torch.save(self.actor.state_dict(), os.path.join(save_path, "PPO_actor.pt"))
-        torch.save(self.critic.state_dict(), os.path.join(save_path, "PPO_critic.pt"))
+        torch.save(self.encoder.state_dict(), os.path.join(save_path, "encoder.pt"))
+        torch.save(self.actor.state_dict(), os.path.join(save_path, "actor.pt"))
+        torch.save(self.critic.state_dict(), os.path.join(save_path, "critic.pt"))
         print(f"모델 저장 완료: {save_path}")
 
     def load_model(self, load_path):
-        self.actor.load_state_dict(torch.load(os.path.join(load_path, "PPO_actor.pt"), weights_only=True))
-        self.critic.load_state_dict(torch.load(os.path.join(load_path, "PPO_critic.pt"), weights_only=True))
+        self.encoder.load_state_dict(torch.load(os.path.join(load_path, "encoder.pt"), weights_only=True))
+        self.actor.load_state_dict(torch.load(os.path.join(load_path, "actor.pt"), weights_only=True))
+        self.critic.load_state_dict(torch.load(os.path.join(load_path, "critic.pt"), weights_only=True))
         print(f"모델 로드 완료: {load_path}")
-
-    def close(self):
-        if self.writer:
-            self.writer.close()

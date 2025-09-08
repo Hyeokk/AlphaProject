@@ -72,9 +72,9 @@ class MoraiEnv(gym.Env):
         rospy.loginfo("Init Complete")
 
     def _get_state(self):
-        pos = self.sensor.get_position()
-        v = self.sensor.get_velocity()
-        idx = self.sensor.get_target_index()
+        pos = self.sensor.get_position() #차량 현재 위치
+        v = self.sensor.get_velocity() #차량 현재 속도
+        idx = self.sensor.get_target_index() #차량 경로 인덱스
 
         # lookahead 만큼의 점 추출
         future_points = []
@@ -110,22 +110,12 @@ class MoraiEnv(gym.Env):
         except subprocess.CalledProcessError as e:
             rospy.logerr(f"Reset failed: {e}")
 
-        # 유효한 관측값을 받을 때까지 기다림 (리셋 후에만 확인)
-        obs = None
-        timeout = 1.0  # 2초 타임아웃
-        start_time = time.time()
-        
-        while obs is None and time.time() - start_time < timeout:
-            obs = self.sensor.get_image()
-            if obs is None or not np.any(obs):  # 이미지가 None이거나 모두 0인 경우
-                obs = None
-                rospy.sleep(0.1)
-        
-        # 타임아웃 후에도 유효한 관측값이 없으면 예외 발생
-        if obs is None:
-            rospy.logerr("CRITICAL ERROR: Failed to get valid observation after reset - terminating node")
-            raise SensorTimeoutError("No valid sensor data received after timeout")
-            
+        # 위치/속도 초기화는 sensor가 관리
+        pos = self.sensor.get_position()
+        v = self.sensor.get_velocity()
+        if pos is None:
+            raise SensorTimeoutError("No valid position after reset")
+
         return self.get_observation(), {}
 
     def step(self, action):
@@ -135,14 +125,16 @@ class MoraiEnv(gym.Env):
         self.sensor.send_control(steering, throttle)
 
         time.sleep(0.1)  # 물리 엔진 반영 시간 대기
-        obs = self.sensor.get_image()
+        
+        # 보상 계산 (CTE 기반)
+        pos = self.sensor.get_position()
+        cte = Cal_CTE.calculate_cte(pos, self.path)
+        reward = -abs(cte)  # 오차 작을수록 보상↑
 
-        # 보상 및 종료 계산
-        reward = self._reward_fn(obs) if self._reward_fn else 0.0
-        done = self._terminated_fn(obs) if self._terminated_fn else False
+        # 종료 조건: 오차가 임계값 이상이면 종료
+        done = abs(cte) > 3.0
 
-        info = {}
-        return self.get_observation(), reward, done, False, info
+        return self.get_observation(), reward, done, False, {}
     
     def render(self):
         image = self.sensor.get_image()

@@ -17,14 +17,13 @@ from models.PPO import PPOAgentVector
 # 설정
 # =============================================================================
 SAVE_DIR = "/home/hyeokk/catkin_ws/src/pt/"
-ALGO_NAME = "ControlModelPPO"
-LANE_TYPE = "Normal"  # "solid", "dashed", "night"
-ENV_NUM = 2  # 환경 ID (0:실선, 1:점선, 2:야간)
-LOG_DIR = f"/home/hyeokk/catkin_ws/src/logs/{ALGO_NAME}_env{ENV_NUM}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+ALGO_NAME = "ControlPPO"
+CSV_NAME = "data"  # csv 이름
+LOG_DIR = f"/home/hyeokk/catkin_ws/src/logs/{ALGO_NAME}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-CENTERLINE_CSV_PATH = f"/home/hyeokk/catkin_ws/src/data/{LANE_TYPE}_lane.csv"
+CENTERLINE_CSV_PATH = f"/home/hyeokk/catkin_ws/src/data/{CSV_NAME}.csv"
 
 # 시드 설정
 SEED = 42
@@ -81,8 +80,8 @@ def main():
     env.set_reward_fn(RewardFns.path_following_reward(lookahead=LOOKAHEAD_POINTS))
     env.set_episode_over_fn(TerminatedFns.path_done(sensor))
     # 초기 관측 확인
-    obs_dict, _ = env.reset()
-    if obs_dict is None:
+    obs, _ = env.reset()
+    if obs is None:
         print("[ERROR] 환경 초기화 실패")
         return
 
@@ -115,8 +114,8 @@ def main():
             break
 
         # 에피소드 초기화
-        obs_dict, _ = env.reset()
-        if obs_dict is None:
+        obs, _ = env.reset()
+        if obs is None:
             continue
         
         agent.buffer.episode_reset()
@@ -129,10 +128,10 @@ def main():
                 break
                 
             # 액션 선택
-            action, log_prob, value = agent.get_action(obs_dict, training=True)
-            next_obs_dict, reward, done, _, _ = env.step(action)
+            action, log_prob, value = agent.get_action(obs, training=True)
+            next_obs, reward, done, _, _ = env.step(action)
             
-            if next_obs_dict is None:
+            if next_obs is None:
                 break
             
             current_velocity = env.sensor.get_velocity()
@@ -146,7 +145,7 @@ def main():
                     press_key('q')  # 자율주행 모드 재시작
 
                     agent.buffer.remove_last_episode()
-                    obs_dict, _ = env.reset()
+                    obs, _ = env.reset()
 
                     low_velocity_count = 0
                     break
@@ -154,8 +153,8 @@ def main():
                 low_velocity_count = 0
 
             if episode_steps > 1:
-                is_step1 = agent.store(obs_dict, action, reward, value[0], log_prob[0],
-                               done, next_obs_dict if not done else None)
+                is_step1 = agent.store(obs, action, reward, value[0], log_prob[0],
+                               done, next_obs if not done else None)
             else:
                 is_step1 = True
 
@@ -165,7 +164,7 @@ def main():
                 break
             
             # 상태 업데이트
-            obs_dict = next_obs_dict
+            obs = next_obs
             total_reward += reward
             episode_steps += 1
             total_steps += 1
@@ -179,7 +178,7 @@ def main():
                     print(f"  손실 - Actor: {train_metrics['actor_loss']:.4f}, "
                           f"Critic: {train_metrics['critic_loss']:.4f}, "
                           f"Entropy: {train_metrics['entropy']:.4f}")
-                if obs_dict is None:
+                if obs is None:
                     continue
                 agent.buffer.clear()
                 break
@@ -204,7 +203,7 @@ def main():
             if consecutive_short_episodes >= 3:
                 print(f"[WARN] 연속 {consecutive_short_episodes}회 무효 에피소드 → 환경 리셋")
                 press_key('q')
-                obs_dict, _ = env.reset()
+                obs, _ = env.reset()
                 consecutive_short_episodes = 0
 
             continue
